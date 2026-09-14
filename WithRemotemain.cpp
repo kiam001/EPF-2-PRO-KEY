@@ -51,6 +51,7 @@ bool isRemoteConnected = false;
 
 unsigned long lastScooterReconnect = 0;
 unsigned long lastRemoteReconnect = 0;
+unsigned long lastCommandTime = 0; 
 
 // --- LOKALER SCOOTER STATUS ---
 bool scooterLocked = false; 
@@ -64,13 +65,12 @@ uint8_t currentGear = 3;
 uint8_t lastActiveGear = 3; 
 
 // ==========================================
-// NEUES DISPLAY-LAYOUT (HUD STYLE)
+// DISPLAY UPDATE (HUD STYLE)
 // ==========================================
 void updateDisplay() {
     display.clearDisplay();
     display.setCursor(0, 0);
     
-    // Zeile 1: F: G/D/S Z: Y/N
     display.print("F: ");
     if (currentGear == 1) display.print("G");
     else if (currentGear == 2) display.print("D");
@@ -79,18 +79,15 @@ void updateDisplay() {
     display.print(" Z: ");
     display.println(zeroStartEnabled ? "Y" : "N");
     
-    // Zeile 2: B: 100%
     display.print("B: ");
     if (currentBattery == 0) display.println("--%"); 
     else { display.print(currentBattery); display.println("%"); }
     
-    // Zeile 3: S: Y/N L: Y/N
     display.print("S: ");
     display.print(scooterLocked ? "Y" : "N");
     display.print(" L: ");
     display.println(lightOn ? "Y" : "N");
 
-    // Zeile 4: Mini Bluetooth Debugging
     display.print(isScooterAuthenticated ? "S:OK " : (isScooterConnected ? "S:-- " : "S:XX "));
     display.println(isRemoteConnected ? "R:OK" : "R:XX");
 
@@ -117,6 +114,8 @@ uint16_t calculateModbusCRC(uint8_t *data, uint8_t len) {
 // ==========================================
 void sendScooterCommand() {
     if (!isScooterAuthenticated || pChDataTx == nullptr) return;
+
+    lastCommandTime = millis(); 
 
     uint8_t configByte = 0x00; 
     
@@ -157,22 +156,31 @@ void authNotifyCallback(NimBLERemoteCharacteristic* pCh, uint8_t* pData, size_t 
 }
 
 void scooterDataCallback(NimBLERemoteCharacteristic* pCh, uint8_t* pData, size_t length, bool isNotify) {
+    if (millis() - lastCommandTime < 1500) return; 
+
     if (length >= 25 && pData[0] == 0xAF && pData[1] == 0x00) {
         currentBattery = pData[5];
         
         bool newLockState = !(pData[21] & 0x08);
         bool newLightState = (pData[22] & 0x04);
         
-        // Wenn der Scooter über die App gesperrt wird, Gedächtnis trotzdem triggern
-        if (newLockState && !scooterLocked) {
-            lightStateBeforeLock = lightOn;
+        if (newLockState != scooterLocked) {
+            if (newLockState) {
+                lightStateBeforeLock = lightOn;
+                preferences.putBool("l_mem", lightStateBeforeLock);
+                lightOn = false;
+            } else {
+                lightOn = lightStateBeforeLock;
+            }
+            scooterLocked = newLockState;
+            preferences.putBool("lock", scooterLocked);
         }
 
-        scooterLocked = newLockState;
-        lightOn = newLightState;
+        if (!scooterLocked) {
+            lightOn = newLightState;
+        }
         
         preferences.putUChar("bat", currentBattery);
-        preferences.putBool("lock", scooterLocked);
         preferences.putBool("light", lightOn);
         updateDisplay();
     }
@@ -187,13 +195,16 @@ void remoteNotifyCallback(NimBLERemoteCharacteristic* pCh, uint8_t* pData, size_
         // --- 0x04 = Vorheriger Titel (Einfachklick) -> Lock/Unlock ---
         if (pData[0] == 0x04) {
             scooterLocked = !scooterLocked;
+            preferences.putBool("lock", scooterLocked); // SOFORT SPEICHERN
             
             if (scooterLocked) {
-                lightStateBeforeLock = lightOn; // Licht vor dem Sperren merken
-                lightOn = false;                // Licht zum Parken ausschalten
+                lightStateBeforeLock = lightOn; 
+                preferences.putBool("l_mem", lightStateBeforeLock); 
+                lightOn = false;                
             } else {
-                lightOn = lightStateBeforeLock; // Licht wiederherstellen
+                lightOn = lightStateBeforeLock; 
             }
+            preferences.putBool("light", lightOn); // SOFORT SPEICHERN
             sendScooterCommand();
         }
         
@@ -201,39 +212,43 @@ void remoteNotifyCallback(NimBLERemoteCharacteristic* pCh, uint8_t* pData, size_
         else if (pData[0] == 0x10) {
             if (!scooterLocked) {
                 lightOn = !lightOn;
+                preferences.putBool("light", lightOn); // SOFORT SPEICHERN
                 sendScooterCommand();
             } else {
-                // Wenn im Parkmodus geklickt wird, verändern wir nur das Gedächtnis
                 lightStateBeforeLock = !lightStateBeforeLock;
+                preferences.putBool("l_mem", lightStateBeforeLock); // SOFORT SPEICHERN
+                updateDisplay(); 
             }
         }
         
         // --- 0x08 = Nächster Titel (Einfachklick) -> Gangwechsel / Zurück ---
         else if (pData[0] == 0x08) {
             if (currentGear == 1) {
-                // Aus dem Geh-Modus zurück in den zuletzt genutzten Modus springen
                 currentGear = lastActiveGear; 
             } else {
-                // Zwischen D und S umschalten
                 currentGear = (currentGear == 2) ? 3 : 2;
-                lastActiveGear = currentGear; // Für später merken
+                lastActiveGear = currentGear; 
             }
+            preferences.putUChar("gear", currentGear); // SOFORT SPEICHERN
+            preferences.putUChar("l_gear", lastActiveGear); // SOFORT SPEICHERN
             sendScooterCommand();
         }
         
         // --- 0x40 = Nächster Titel (Doppelklick) -> Geh Modus (1) ---
         else if (pData[0] == 0x40) {
             if (currentGear != 1) {
-                lastActiveGear = currentGear; // Alten Gang (2 oder 3) retten
+                lastActiveGear = currentGear; 
+                preferences.putUChar("l_gear", lastActiveGear); // SOFORT SPEICHERN
             }
             currentGear = 1;
+            preferences.putUChar("gear", currentGear); // SOFORT SPEICHERN
             sendScooterCommand();
         }
         
         // --- 0x80 = Vorheriger Titel (Doppelklick) -> Zero-Start ---
         else if (pData[0] == 0x80) {
             zeroStartEnabled = !zeroStartEnabled;
-            preferences.putBool("zero", zeroStartEnabled);
+            preferences.putBool("zero", zeroStartEnabled); // SOFORT SPEICHERN
             sendScooterCommand();
         }
     }
@@ -337,14 +352,17 @@ void connectToRemote() {
 void setup() {
     Serial.begin(115200);
     
+    // ALLE gespeicherten Einstellungen aus dem Flash-Speicher laden
     preferences.begin("epf", false);
     scooterLocked = preferences.getBool("lock", false);
     lightOn = preferences.getBool("light", false);
     zeroStartEnabled = preferences.getBool("zero", true);
     currentBattery = preferences.getUChar("bat", 0);
     
-    // Beim Booten gehen wir davon aus, dass das Licht-Gedächtnis dem aktuellen Zustand entspricht
-    lightStateBeforeLock = lightOn;
+    currentGear = preferences.getUChar("gear", 3);       // Standard: Sport (3)
+    lastActiveGear = preferences.getUChar("l_gear", 3);  // Standard: Sport (3)
+    
+    lightStateBeforeLock = preferences.getBool("l_mem", lightOn);
 
     pinMode(VEXT_PIN, OUTPUT);
     digitalWrite(VEXT_PIN, LOW); 
