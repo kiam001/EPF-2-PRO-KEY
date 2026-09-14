@@ -46,3 +46,60 @@ Ein großer Teil dieses Codes, der Bluetooth-Logik und dieser Dokumentation wurd
 📜 Lizenz
 
 Do Whatever You Want. Viel Spaß beim Basteln!
+
+
+# 🛴 ePF-2 SmartRemote Controller (ESP32-S3)
+
+Dieses Projekt verwandelt einen ESP32-S3 (Heltec Wireless Stick V3) in eine unsichtbare Brücke zwischen einer handelsüblichen BLE-Multimedia-Fernbedienung ("SmartRemote") und einem ePowerFun ePF-2 E-Scooter (HobbyWing/Zydtech Controller). 
+
+Der ESP32 baut **zwei Bluetooth-Verbindungen gleichzeitig** auf, übersetzt die HID-Tastenanschläge der Fernbedienung in Modbus-Steuerbefehle und sendet sie in Echtzeit an den Scooter. Ein integriertes OLED-Display dient als kompaktes Head-Up-Display (HUD).
+
+---
+
+## ⚠️ Disclaimer (KI & Sicherheit)
+
+**KI-Disclaimer:**  
+> Der Code und die Dokumentation in diesem Projekt wurden in iterativer Zusammenarbeit mit einer Künstlichen Intelligenz (KI) entwickelt. Obwohl der Code intensiv auf Funktionstüchtigkeit getestet wurde, können unerwartete Verhaltensweisen, Ineffizienzen oder Bugs nicht vollständig ausgeschlossen werden. 
+
+**Sicherheits- & Haftungsausschluss:**  
+> Die Modifikation der Steuerung eines E-Scooters geschieht **ausschließlich auf eigene Gefahr**. Falsche Konfigurationsdaten oder Verbindungsabbrüche können zu unerwartetem Fahrverhalten (z.B. plötzlicher Parkmodus) führen. 
+> * Dieses Projekt ist nicht von ePowerFun oder HobbyWing autorisiert.
+> * Die Nutzung im öffentlichen Straßenverkehr (StVZO) kann durch solche Modifikationen die Betriebserlaubnis erlöschen lassen.
+> * Der Autor übernimmt **keinerlei Haftung** für Personen-, Sach- oder Folgeschäden, die durch die Nutzung dieses Codes entstehen.
+
+---
+
+## ✨ Features
+
+* **Dual-BLE-Master:** Der ESP32 verwaltet gleichzeitig die verschlüsselte Verbindung zur Fernbedienung und die Modbus-Sitzung zum Scooter.
+* **Intelligentes Licht-Gedächtnis:** Wird der Scooter gesperrt, schaltet sich das Licht zum Stromsparen aus. Beim Entsperren wird der exakte vorherige Lichtstatus wiederhergestellt.
+* **Smarte Gangschaltung:** Ein Doppelklick aktiviert den Geh-Modus (Gear 1). Ein Einfachklick danach springt exakt in den Fahrmodus (Dynamic oder Sport) zurück, den du vorher genutzt hast.
+* **Zero-Start Toggle:** Direktstart aus dem Stand per Knopfdruck aktivierbar. Die Einstellung wird im Flash-Speicher des ESP32 (`Preferences`) gesichert und überlebt einen Neustart.
+* **HUD-Display:** Kompakte Statusanzeige aller wichtigen Parameter auf dem 64x32 OLED.
+
+---
+
+## 🎮 Tastenbelegung (SmartRemote)
+
+Die Tasten einer handelsüblichen BLE-Fernbedienung (Media-Keys) wurden wie folgt gemappt:
+
+| Taste auf Fernbedienung | Aktion | Beschreibung |
+| :--- | :--- | :--- |
+| **Play / Pause** *(Klick)* | 💡 **Licht umschalten** | Schaltet das Scooter-Licht An/Aus. Im gesperrten Zustand wird der Status nur für das spätere Entsperren gemerkt. |
+| **Vorheriger Titel** *(Klick)* | 🔒 **Sperren / Entsperren** | Aktiviert die elektronische Wegfahrsperre. |
+| **Vorheriger Titel** *(Doppelklick)* | 🚀 **Zero-Start (An/Aus)** | Schaltet den Direktstart um (Speicherung im Flash). |
+| **Nächster Titel** *(Klick)* | ⚙️ **Gangwechsel (D/S)** | Wechselt zwischen Dynamic (10 km/h) und Sport (22 km/h). Kommt man aus dem Geh-Modus, wird der letzte Modus wiederhergestellt. |
+| **Nächster Titel** *(Doppelklick)*| 🚶 **Geh-Modus (Gear 1)**| Erzwingt den Geh-Modus (6 km/h). |
+
+---
+
+## 📺 Das HUD-Display
+
+Das integrierte OLED-Display zeigt alle Live-Daten im folgenden Format an:
+
+```text
+F: S  Z: Y     <-- [F]ahrmodus: G(eh)/D(ynamic)/S(port) | [Z]ero-Start: Y(es)/N(o)
+B: 85%         <-- [B]attery: Akku in Prozent
+S: N  L: Y     <-- [S]perre aktiv: Y/N | [L]icht an: Y/N
+S:OK  R:OK     <-- Debug: [S]cooter Verbunden & Auth | [R]emote Verbunden
+``
