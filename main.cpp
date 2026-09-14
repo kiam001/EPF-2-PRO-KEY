@@ -3,22 +3,35 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <Preferences.h> // NEU: Für den internen Speicher
+#include <Preferences.h>
 
-// --- KONFIGURATION ---
+// ==========================================
+// --- 1. VERBINDUNGS-DATEN ---
+// ==========================================
 #define SCOOTER_MAC "AA:BB:CC:DD:EE:FF" // MAC-Adresse deines ePF-Scooters
 #define PIN_CODE "888888"               // 6-stelliger App-Code (Default: 888888)
-#define BUTTON_PIN 0
+#define BUTTON_PIN 0                    // BOOT/PRG Button beim ESP32-S3
 
-// --- PINS ---
+// ==========================================
+// --- 2. FAHR-EINSTELLUNGEN ---
+// ==========================================
+#define SPEED_GEAR_1 6  
+#define SPEED_GEAR_2 15 
+#define SPEED_GEAR_3 22 
+
+// ZERO-START (Bit 5 im configByte aktiviert den Direktstart aus dem Stand)
+#define ZERO_START_BIT (1 << 5)     
+
+// --- PINS (Heltec Wireless Stick V3) ---
 #define VEXT_PIN 36
 #define OLED_SDA 17
 #define OLED_SCL 18
 #define OLED_RST 21
 
 Adafruit_SSD1306 display(64, 32, &Wire, OLED_RST);
-Preferences preferences; // NEU: Speicher-Objekt
+Preferences preferences;
 
+// --- UUIDs ---
 static NimBLEUUID authServiceUUID("F2F0");
 static NimBLEUUID authTxUUID("F2F1");
 static NimBLEUUID authRxUUID("F2F2");
@@ -26,6 +39,7 @@ static NimBLEUUID dataServiceUUID("F1F0");
 static NimBLEUUID dataTxUUID("F1F1");
 static NimBLEUUID dataRxUUID("F1F2");
 
+// --- BLE VARIABLEN ---
 NimBLEClient* pClient = nullptr;
 NimBLERemoteCharacteristic* pChAuthTx = nullptr;
 NimBLERemoteCharacteristic* pChAuthRx = nullptr;
@@ -35,18 +49,22 @@ NimBLERemoteCharacteristic* pChDataRx = nullptr;
 bool isConnected = false;
 bool isAuthenticated = false;
 
-// Variablen werden nun im setup() aus dem Speicher geladen
+// --- LOKALER STATUS ---
 bool scooterLocked = false; 
 bool lightOn = false;       
 uint8_t currentBattery = 0;
 
+// --- BUTTON LOGIK ---
 int lastButtonState = HIGH;
 unsigned long buttonPressTime = 0;
 bool isPressing = false;
-const unsigned long longPressThreshold = 600;
+const unsigned long longPressThreshold = 600; 
 
 unsigned long lastReconnectAttempt = 0;
 
+// ==========================================
+// DISPLAY UPDATE
+// ==========================================
 void updateDisplay() {
     display.clearDisplay();
     display.setCursor(0, 0);
@@ -56,12 +74,11 @@ void updateDisplay() {
     } else if (!isAuthenticated) {
         display.println("Auth...");
     } else {
-        // Direkt in den normalen Betrieb!
         display.println("Verbunden");
         
         display.print("Akku: ");
         if (currentBattery == 0) {
-            display.println("--%"); // Falls noch nie ein Wert gespeichert wurde
+            display.println("--%"); 
         } else if (currentBattery >= 100) {
             display.println("FU");
         } else {
@@ -79,7 +96,9 @@ void updateDisplay() {
     display.display();
 }
 
-// --- CALLBACK FÜR VERBINDUNGSABBRÜCHE ---
+// ==========================================
+// CALLBACK FÜR VERBINDUNGSABBRÜCHE
+// ==========================================
 class MyClientCallback : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient* pclient) override {
         Serial.println("Verbindung getrennt!");
@@ -89,6 +108,9 @@ class MyClientCallback : public NimBLEClientCallbacks {
     }
 };
 
+// ==========================================
+// MODBUS CRC16 BERECHNUNG (Big-Endian)
+// ==========================================
 uint16_t calculateModbusCRC(uint8_t *data, uint8_t len) {
     uint16_t crc = 0xFFFF;
     for (uint8_t pos = 0; pos < len; pos++) {
@@ -104,16 +126,33 @@ uint16_t calculateModbusCRC(uint8_t *data, uint8_t len) {
     return crc;
 }
 
+// ==========================================
+// STEUERBEFEHL SENDEN
+// ==========================================
 void sendControlCommand() {
     if (!isAuthenticated || pChDataTx == nullptr) return;
 
-    uint8_t packet[10] = {0xAF, 0x00, 0x0A, 0x00, 0x03, 0x05, 0x0F, 0x14, 0x00, 0x00};
+    // Basis: 3. Gang (Bit 0 & 1)
     uint8_t configByte = 0x02; 
     
-    if (!scooterLocked) configByte |= 0x80;
-    if (lightOn) configByte |= 0x04;
+    if (!scooterLocked) configByte |= 0x80; // Bit 7: Lock
+    if (lightOn) configByte |= 0x04;        // Bit 2: Licht
+    configByte |= ZERO_START_BIT;           // Bit 5: Zero-Start
 
-    packet[3] = configByte;
+    // Paket zusammenbauen
+    uint8_t packet[10] = {
+        0xAF, 
+        0x00, 
+        0x0A, 
+        configByte, 
+        0x03, 
+        SPEED_GEAR_1, 
+        SPEED_GEAR_2, 
+        SPEED_GEAR_3, 
+        0x00, 
+        0x00
+    };
+
     uint16_t crc = calculateModbusCRC(packet, 8);
     packet[8] = (crc & 0xFF);        
     packet[9] = (crc >> 8) & 0xFF;   
@@ -121,6 +160,9 @@ void sendControlCommand() {
     pChDataTx->writeValue(packet, 10, false);
 }
 
+// ==========================================
+// BLE CALLBACKS (EMPFANG)
+// ==========================================
 void authNotifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
     String response = "";
     for (int i = 0; i < length; i++) response += (char)pData[i];
@@ -134,12 +176,12 @@ void authNotifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8
 
 void dataNotifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
     if (length >= 25 && pData[0] == 0xAF && pData[1] == 0x00) {
-        // 1. Werte aus der Telemetrie auslesen
+        
         currentBattery = pData[5];
+        
         scooterLocked = !(pData[21] & 0x08);
         lightOn = (pData[22] & 0x04);
         
-        // 2. Werte direkt fest im ESP32 abspeichern
         preferences.putUChar("bat", currentBattery);
         preferences.putBool("lock", scooterLocked);
         preferences.putBool("light", lightOn);
@@ -148,6 +190,9 @@ void dataNotifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8
     }
 }
 
+// ==========================================
+// VERBINDUNGSAUFBAU
+// ==========================================
 bool connectToScooter() {
     Serial.println("Versuche zu verbinden...");
     NimBLEAddress scooterAddress(SCOOTER_MAC);
@@ -187,14 +232,15 @@ bool connectToScooter() {
     return true;
 }
 
+// ==========================================
+// SETUP
+// ==========================================
 void setup() {
     Serial.begin(115200);
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     
-    // Speicher initialisieren ("epf" ist der Namensraum)
     preferences.begin("epf", false);
     
-    // Letzte bekannte Werte laden (die False/0 am Ende sind die Standardwerte beim allerersten Start)
     scooterLocked = preferences.getBool("lock", false);
     lightOn = preferences.getBool("light", false);
     currentBattery = preferences.getUChar("bat", 0);
@@ -214,6 +260,9 @@ void setup() {
     connectToScooter();
 }
 
+// ==========================================
+// MAIN LOOP
+// ==========================================
 void loop() {
     if (!isConnected) {
         if (millis() - lastReconnectAttempt > 3000) { 
@@ -235,13 +284,10 @@ void loop() {
             isPressing = false;
             
             if (isConnected && isAuthenticated) {
-                // Keine Sync-Taste mehr nötig! Wir nutzen die gespeicherten Variablen.
                 if (pressDuration >= longPressThreshold) {
                     lightOn = !lightOn;
-                    // Wir speichern hier noch nicht, sondern warten auf die Bestätigung
-                    // vom Scooter in dataNotifyCallback.
                     sendControlCommand();
-                } else if (pressDuration > 50) {
+                } else if (pressDuration > 50) { 
                     scooterLocked = !scooterLocked;
                     sendControlCommand();
                 }
