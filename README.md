@@ -102,4 +102,111 @@ F: S  Z: Y     <-- [F]ahrmodus: G(eh)/D(ynamic)/S(port) | [Z]ero-Start: Y(es)/N(
 B: 85%         <-- [B]attery: Akku in Prozent
 S: N  L: Y     <-- [S]perre aktiv: Y/N | [L]icht an: Y/N
 S:OK  R:OK     <-- Debug: [S]cooter Verbunden & Auth | [R]emote Verbunden
-``
+```
+# 🛴 ePF-2 Dual-SmartRemote Controller (ESP32-S3)
+
+Dieses Projekt verwandelt einen ESP32-S3 (Heltec Wireless Stick V3) in eine intelligente Steuerzentrale für einen ePowerFun ePF-2 E-Scooter (HobbyWing/Zydtech Controller). 
+
+Das Besondere an diesem **Dual-Setup**: Der ESP32 baut **drei Bluetooth-Verbindungen gleichzeitig** auf. Er verbindet den Scooter mit zwei separaten BLE-Multimedia-Fernbedienungen:
+1. **Remote 1 (Der Schlüssel):** Gedacht für die Hosentasche oder den Schlüsselbund. Sie steuert die Wegfahrsperre und Grundeinstellungen.
+2. **Remote 2 (Das Dashboard):** Gedacht für die feste Montage am Lenker. Sie erlaubt das blinde, direkte Umschalten der Gänge (6 / 15 / 22 km/h) und des Lichts während der Fahrt, ohne eine Lock-Funktion zu besitzen (verhindert versehentliches Sperren während der Fahrt).
+
+Ein integriertes OLED-Display dient als kompaktes Head-Up-Display (HUD).
+
+---
+
+## ⚠️ Disclaimer (KI & Sicherheit)
+
+**KI-Disclaimer:**  
+> Der Code und die Dokumentation in diesem Projekt wurden in iterativer Zusammenarbeit mit einer Künstlichen Intelligenz (KI) entwickelt. Obwohl der Code intensiv auf Funktionstüchtigkeit getestet wurde, können unerwartete Verhaltensweisen, Ineffizienzen oder Bugs nicht vollständig ausgeschlossen werden. 
+
+**Sicherheits- & Haftungsausschluss:**  
+> Die Modifikation der Steuerung eines E-Scooters geschieht **ausschließlich auf eigene Gefahr**. Falsche Konfigurationsdaten oder Verbindungsabbrüche können zu unerwartetem Fahrverhalten (z.B. plötzlicher Parkmodus) führen. 
+> * Dieses Projekt ist nicht von ePowerFun oder HobbyWing autorisiert.
+> * Die Nutzung im öffentlichen Straßenverkehr (StVZO) kann durch solche Modifikationen die Betriebserlaubnis erlöschen lassen.
+> * Der Autor übernimmt **keinerlei Haftung** für Personen-, Sach- oder Folgeschäden, die durch die Nutzung dieses Codes entstehen.
+
+---
+
+## ✨ Features
+
+* **Tri-BLE-Master:** Der ESP32 verwaltet gleichzeitig die Modbus-Sitzung zum Scooter und zwei verschlüsselte Verbindungen zu den Fernbedienungen.
+* **Elefanten-Gedächtnis (Flash-Save):** Absolut jede Änderung (Licht, Sperre, Fahrmodus, Zero-Start) wird in der Millisekunde des Tastendrucks im Flash-Speicher des ESP32 gesichert.
+* **Intelligentes Licht-Gedächtnis:** Wird der Scooter gesperrt, schaltet sich das Licht zum Stromsparen aus. Beim Entsperren wird der exakte vorherige Lichtstatus wiederhergestellt.
+* **Zero-Start Toggle:** Direktstart aus dem Stand umschaltbar.
+* **HUD-Display:** Kompakte Statusanzeige aller wichtigen Parameter auf dem 64x32 OLED, inklusive Verbindungsstatus für alle drei Geräte.
+
+---
+
+## 🎮 Tastenbelegung
+
+Das System nutzt zwei handelsübliche BLE-Fernbedienungen (Media-Keys), die strikt nach Anwendungszweck getrennt sind.
+
+### 🔑 REMOTE 1 (Der Schlüssel - Zum Mitnehmen)
+Diese Fernbedienung dient als digitaler Schlüssel und besitzt die exklusive Berechtigung, die Wegfahrsperre zu bedienen.
+
+| Taste | Aktion | Beschreibung |
+| :--- | :--- | :--- |
+| **Vorheriger Titel** *(Klick)* | 🔒 **Sperren / Entsperren** | Aktiviert/Deaktiviert die elektronische Wegfahrsperre. |
+| **Play / Pause** *(Klick)* | 💡 **Licht umschalten** | Schaltet das Scooter-Licht An/Aus. |
+| **Nächster Titel** *(Klick)* | ⚙️ **Gangwechsel (D/S)** | Umschalten zwischen Dynamic und Sport. |
+| **Nächster Titel** *(Doppelklick)*| 🚶 **Geh-Modus**| Erzwingt den Eco/Geh-Modus. |
+| **Vorheriger Titel** *(Doppelklick)* | 🚀 **Zero-Start (An/Aus)** | Schaltet den Direktstart um. |
+
+### 🚲 REMOTE 2 (Das Dashboard - Fest am Lenker)
+Diese Fernbedienung ist für die blinde Bedienung während der Fahrt optimiert. **Sie besitzt absichtlich keine Lock-Funktion**, um gefährliches Absperren während der Fahrt auszuschließen. Jeder Gang hat eine eigene, feste Taste.
+
+| Taste | Aktion | Beschreibung |
+| :--- | :--- | :--- |
+| **Vorheriger Titel** *(Klick)* | 🐢 **Eco Modus (Gear 1)** | Direkter Wechsel in den Eco-Modus (6 km/h). |
+| **Play / Pause** *(Klick)* | 🐇 **Dynamic Modus (Gear 2)**| Direkter Wechsel in den Dynamic-Modus (15 km/h). |
+| **Nächster Titel** *(Klick)* | 🐆 **Sport Modus (Gear 3)** | Direkter Wechsel in den Sport-Modus (22 km/h). |
+| **Nächster Titel** *(Doppelklick)* | 💡 **Licht umschalten** | Schaltet das Scooter-Licht An/Aus. |
+| **Vorheriger Titel** *(Doppelklick)*| 🚀 **Zero-Start (An/Aus)** | Schaltet den Direktstart um. |
+
+---
+
+## 📺 Das HUD-Display
+
+Das integrierte OLED-Display zeigt alle Live-Daten im folgenden Format an:
+
+```text
+F: S  Z: Y     <-- [F]ahrmodus: G(eh)/D(ynamic)/S(port) | [Z]ero-Start: Y(es)/N(o)
+B: 85%         <-- [B]attery: Akku in Prozent
+S: N  L: Y     <-- [S]perre aktiv: Y/N | [L]icht an: Y/N
+S:Y R:1,2      <-- [S]cooter Verbunden: Y/N | [R]emote Verbunden: 1 und/oder 2 (-)
+```
+
+🛠️ Hardware & Voraussetzungen
+
+    Microcontroller: Heltec Wireless Stick V3 (ESP32-S3 mit 64x32 OLED).
+
+    Scooter: ePowerFun ePF-2 (HobbyWing-Controller mit Modbus via BLE).
+
+    Fernbedienungen: 2x BLE Multimedia Remote (im Code konfiguriert als HID-Device mit UUID 1812).
+
+Software-Abhängigkeiten (PlatformIO / Arduino IDE):
+
+    NimBLE-Arduino (Zwingend erforderlich für 3 gleichzeitige, stabile BLE-Verbindungen)
+
+    Adafruit GFX Library
+
+    Adafruit SSD1306
+
+⚙️ Installation & Setup
+
+    Repository klonen oder als .zip herunterladen.
+
+    In der Datei main.cpp die MAC-Adressen anpassen:
+    C++
+
+    #define SCOOTER_MAC "42:03:10:XX:XX:XX" // Eigene ePF-2 MAC
+    #define PIN_CODE "123456"               // Eigener 6-stelliger App-Code
+    #define REMOTE1_MAC "f2:8d:f6:XX:XX:XX" // MAC der Schlüssel-Remote
+    #define REMOTE2_MAC "3c:58:2b:XX:XX:XX" // MAC der Lenker-Remote
+
+    Code kompilieren und auf den ESP32-S3 flashen.
+
+    Wichtig beim ersten Start: Beide Fernbedienungen müssen einzeln für das erstmalige Pairing in den Kopplungs-Modus versetzt werden, damit der ESP32 die Verschlüsselungsschlüssel austauschen und dauerhaft speichern kann.
+
+Ride safe! 🛴💨
