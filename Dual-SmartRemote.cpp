@@ -13,11 +13,12 @@
 #define REMOTE1_MAC "AA:BB:CC:DD:EE:FF" // Alte Fernbedienung (Links)
 #define REMOTE2_MAC "AA:BB:CC:DD:EE:FF" // NEUE Fernbedienung (Rechts)
 
+
 // ==========================================
 // --- 2. FAHR-EINSTELLUNGEN ---
 // ==========================================
 #define SPEED_GEAR_1 6  
-#define SPEED_GEAR_2 15 
+#define SPEED_GEAR_2 10 
 #define SPEED_GEAR_3 22 
 
 #define ZERO_START_BIT (1 << 5)     
@@ -45,33 +46,38 @@ NimBLEClient* pScooterClient = nullptr;
 NimBLEClient* pRemote1Client = nullptr;
 NimBLEClient* pRemote2Client = nullptr;
 
-NimBLERemoteCharacteristic* pChAuthTx = nullptr;
-NimBLERemoteCharacteristic* pChDataTx = nullptr;
+NimBLERemoteCharacteristic* volatile pChAuthTx = nullptr;
+NimBLERemoteCharacteristic* volatile pChDataTx = nullptr;
 
-// --- STATUS VARIABLEN ---
-bool isScooterConnected = false;
-bool isScooterAuthenticated = false;
-bool isRemote1Connected = false;
-bool isRemote2Connected = false;
+// --- STATUS VARIABLEN (volatile für Thread-Sicherheit) ---
+volatile bool isScooterConnected = false;
+volatile bool isScooterAuthenticated = false;
+volatile bool isRemote1Connected = false;
+volatile bool isRemote2Connected = false;
+
+// --- THREAD-SAFE FLAGS FÜR DIE HAUPTSCHLEIFE ---
+volatile bool flagUpdateDisplay = false;
+volatile bool flagSendCommand = false;
+volatile bool flagSavePrefs = false;
 
 unsigned long lastScooterReconnect = 0;
 unsigned long lastRemote1Reconnect = 0;
 unsigned long lastRemote2Reconnect = 0;
-unsigned long lastCommandTime = 0; 
+volatile unsigned long lastCommandTime = 0; 
 
 // --- LOKALER SCOOTER STATUS ---
-bool scooterLocked = false; 
-bool lightOn = false; 
-bool zeroStartEnabled = true;      
-uint8_t currentBattery = 0;
+volatile bool scooterLocked = false; 
+volatile bool lightOn = false; 
+volatile bool zeroStartEnabled = true;      
+volatile uint8_t currentBattery = 0;
 
 // Logik-Speicher für Licht & Gänge
-bool lightStateBeforeLock = false; 
-uint8_t currentGear = 3; 
-uint8_t lastActiveGear = 3; 
+volatile bool lightStateBeforeLock = false; 
+volatile uint8_t currentGear = 3; 
+volatile uint8_t lastActiveGear = 3; 
 
 // ==========================================
-// DISPLAY UPDATE (HUD STYLE)
+// DISPLAY UPDATE (Wird nur noch sicher in loop() aufgerufen)
 // ==========================================
 void updateDisplay() {
     display.clearDisplay();
@@ -104,6 +110,19 @@ void updateDisplay() {
 }
 
 // ==========================================
+// PREFERENCES SPEICHERN (Sicher außerhalb von BLE-Callbacks)
+// ==========================================
+void savePreferences() {
+    preferences.putBool("lock", scooterLocked);
+    preferences.putBool("light", lightOn);
+    preferences.putBool("l_mem", lightStateBeforeLock);
+    preferences.putBool("zero", zeroStartEnabled);
+    preferences.putUChar("bat", currentBattery);
+    preferences.putUChar("gear", currentGear);
+    preferences.putUChar("l_gear", lastActiveGear);
+}
+
+// ==========================================
 // MODBUS CRC16 BERECHNUNG
 // ==========================================
 uint16_t calculateModbusCRC(uint8_t *data, uint8_t len) {
@@ -122,7 +141,9 @@ uint16_t calculateModbusCRC(uint8_t *data, uint8_t len) {
 // BEFEHL AN DEN SCOOTER SENDEN
 // ==========================================
 void sendScooterCommand() {
-    if (!isScooterAuthenticated || pChDataTx == nullptr) return;
+    if (!isScooterConnected || !isScooterAuthenticated || pChDataTx == nullptr) return;
+    if (pScooterClient == nullptr || !pScooterClient->isConnected()) return;
+
     lastCommandTime = millis(); 
 
     uint8_t configByte = 0x00; 
@@ -146,7 +167,7 @@ void sendScooterCommand() {
     packet[9] = (crc >> 8) & 0xFF;   
 
     pChDataTx->writeValue(packet, 10, false);
-    updateDisplay();
+    flagUpdateDisplay = true;
 }
 
 // ==========================================
@@ -154,20 +175,26 @@ void sendScooterCommand() {
 // ==========================================
 void authNotifyCallback(NimBLERemoteCharacteristic* pCh, uint8_t* pData, size_t length, bool isNotify) {
     String response = "";
-    for (int i = 0; i < length; i++) response += (char)pData[i];
+    for (size_t i = 0; i < length; i++) response += (char)pData[i];
     
     if (response.indexOf("OK+PWD:Y") >= 0) {
         isScooterAuthenticated = true;
-        sendScooterCommand(); 
+        flagSendCommand = true; 
     }
-    updateDisplay();
+    flagUpdateDisplay = true;
 }
 
 void scooterDataCallback(NimBLERemoteCharacteristic* pCh, uint8_t* pData, size_t length, bool isNotify) {
     if (millis() - lastCommandTime < 1500) return; 
 
     if (length >= 25 && pData[0] == 0xAF && pData[1] == 0x00) {
-        currentBattery = pData[5];
+        bool stateChanged = false;
+
+        uint8_t newBat = pData[5];
+        if (newBat != currentBattery) {
+            currentBattery = newBat;
+            stateChanged = true;
+        }
         
         bool newLockState = !(pData[21] & 0x08);
         bool newLightState = (pData[22] & 0x04);
@@ -175,27 +202,28 @@ void scooterDataCallback(NimBLERemoteCharacteristic* pCh, uint8_t* pData, size_t
         if (newLockState != scooterLocked) {
             if (newLockState) {
                 lightStateBeforeLock = lightOn;
-                preferences.putBool("l_mem", lightStateBeforeLock);
                 lightOn = false;
             } else {
                 lightOn = lightStateBeforeLock;
             }
             scooterLocked = newLockState;
-            preferences.putBool("lock", scooterLocked);
+            stateChanged = true;
         }
 
-        if (!scooterLocked) {
+        if (!scooterLocked && (lightOn != newLightState)) {
             lightOn = newLightState;
+            stateChanged = true;
         }
         
-        preferences.putUChar("bat", currentBattery);
-        preferences.putBool("light", lightOn);
-        updateDisplay();
+        if (stateChanged) {
+            flagSavePrefs = true;
+            flagUpdateDisplay = true;
+        }
     }
 }
 
 // ==========================================
-// CALLBACKS: FERNBEDIENUNG 1 (ALTE LOGIK)
+// CALLBACKS: FERNBEDIENUNG 1 (SCHLÜSSEL LINKS)
 // ==========================================
 void remote1NotifyCallback(NimBLERemoteCharacteristic* pCh, uint8_t* pData, size_t length, bool isNotify) {
     if (length == 2 && pData[1] == 0x00) {
@@ -203,53 +231,62 @@ void remote1NotifyCallback(NimBLERemoteCharacteristic* pCh, uint8_t* pData, size
         // 0x04 = Vorheriger Titel -> Lock/Unlock
         if (pData[0] == 0x04) {
             scooterLocked = !scooterLocked;
-            preferences.putBool("lock", scooterLocked); 
             if (scooterLocked) {
                 lightStateBeforeLock = lightOn; 
-                preferences.putBool("l_mem", lightStateBeforeLock); 
                 lightOn = false;                
-            } else { lightOn = lightStateBeforeLock; }
-            preferences.putBool("light", lightOn);
-            sendScooterCommand();
+            } else {
+                lightOn = lightStateBeforeLock;
+            }
+            lastCommandTime = millis();
+            flagSavePrefs = true;
+            flagSendCommand = true;
+            flagUpdateDisplay = true;
         }
         // 0x10 = Play/Pause -> Licht
         else if (pData[0] == 0x10) {
             if (!scooterLocked) {
                 lightOn = !lightOn;
-                preferences.putBool("light", lightOn);
-                sendScooterCommand();
+                lastCommandTime = millis();
+                flagSavePrefs = true;
+                flagSendCommand = true;
+                flagUpdateDisplay = true;
             } else {
                 lightStateBeforeLock = !lightStateBeforeLock;
-                preferences.putBool("l_mem", lightStateBeforeLock);
-                updateDisplay(); 
+                flagSavePrefs = true;
+                flagUpdateDisplay = true; 
             }
         }
         // 0x08 = Nächster Titel -> Gangwechsel (D/S)
         else if (pData[0] == 0x08) {
             if (currentGear == 1) currentGear = lastActiveGear; 
             else { currentGear = (currentGear == 2) ? 3 : 2; lastActiveGear = currentGear; }
-            preferences.putUChar("gear", currentGear); 
-            preferences.putUChar("l_gear", lastActiveGear); 
-            sendScooterCommand();
+            lastCommandTime = millis();
+            flagSavePrefs = true;
+            flagSendCommand = true;
+            flagUpdateDisplay = true;
         }
         // 0x40 = Nächster Titel (Doppelklick) -> Geh Modus
         else if (pData[0] == 0x40) {
-            if (currentGear != 1) { lastActiveGear = currentGear; preferences.putUChar("l_gear", lastActiveGear); }
+            if (currentGear != 1) { lastActiveGear = currentGear; }
             currentGear = 1;
-            preferences.putUChar("gear", currentGear); 
-            sendScooterCommand();
+            lastCommandTime = millis();
+            flagSavePrefs = true;
+            flagSendCommand = true;
+            flagUpdateDisplay = true;
         }
         // 0x80 = Vorheriger Titel (Doppelklick) -> Zero-Start
         else if (pData[0] == 0x80) {
             zeroStartEnabled = !zeroStartEnabled;
-            preferences.putBool("zero", zeroStartEnabled); 
-            sendScooterCommand();
+            lastCommandTime = millis();
+            flagSavePrefs = true;
+            flagSendCommand = true;
+            flagUpdateDisplay = true;
         }
     }
 }
 
 // ==========================================
-// CALLBACKS: FERNBEDIENUNG 2 (NEUE LOGIK)
+// CALLBACKS: FERNBEDIENUNG 2 (DASHBOARD RECHTS)
 // ==========================================
 void remote2NotifyCallback(NimBLERemoteCharacteristic* pCh, uint8_t* pData, size_t length, bool isNotify) {
     if (length == 2 && pData[1] == 0x00) {
@@ -258,66 +295,78 @@ void remote2NotifyCallback(NimBLERemoteCharacteristic* pCh, uint8_t* pData, size
         if (pData[0] == 0x40) {
             if (!scooterLocked) {
                 lightOn = !lightOn;
-                preferences.putBool("light", lightOn);
-                sendScooterCommand();
+                lastCommandTime = millis();
+                flagSavePrefs = true;
+                flagSendCommand = true;
+                flagUpdateDisplay = true;
             } else {
                 lightStateBeforeLock = !lightStateBeforeLock;
-                preferences.putBool("l_mem", lightStateBeforeLock);
-                updateDisplay(); 
+                flagSavePrefs = true;
+                flagUpdateDisplay = true; 
             }
         }
         // 0x08 = Nächster Titel (Einfachklick) -> Sport Modus (3)
         else if (pData[0] == 0x08) {
             currentGear = 3;
             lastActiveGear = 3; // Speichern für Remote 1
-            preferences.putUChar("gear", currentGear); 
-            preferences.putUChar("l_gear", lastActiveGear);
-            sendScooterCommand();
+            lastCommandTime = millis();
+            flagSavePrefs = true;
+            flagSendCommand = true;
+            flagUpdateDisplay = true;
         }
         // 0x10 = Play/Pause (Einfachklick) -> Dynamic Modus (2)
         else if (pData[0] == 0x10) {
             currentGear = 2;
             lastActiveGear = 2; // Speichern für Remote 1
-            preferences.putUChar("gear", currentGear); 
-            preferences.putUChar("l_gear", lastActiveGear);
-            sendScooterCommand();
+            lastCommandTime = millis();
+            flagSavePrefs = true;
+            flagSendCommand = true;
+            flagUpdateDisplay = true;
         }
         // 0x04 = Vorheriger Titel (Einfachklick) -> Eco/Geh Modus (1)
         else if (pData[0] == 0x04) {
             currentGear = 1;
-            // Wichtig: lastActiveGear wird NICHT überschrieben. 
-            // So weiß Remote 1 später noch, aus welchem Modus du kamst.
-            preferences.putUChar("gear", currentGear); 
-            sendScooterCommand();
+            // lastActiveGear wird NICHT überschrieben
+            lastCommandTime = millis();
+            flagSavePrefs = true;
+            flagSendCommand = true;
+            flagUpdateDisplay = true;
         }
         // 0x80 = Vorheriger Titel (Doppelklick) -> Zero-Start
         else if (pData[0] == 0x80) {
             zeroStartEnabled = !zeroStartEnabled;
-            preferences.putBool("zero", zeroStartEnabled); 
-            sendScooterCommand();
+            lastCommandTime = millis();
+            flagSavePrefs = true;
+            flagSendCommand = true;
+            flagUpdateDisplay = true;
         }
     }
 }
-
 
 // ==========================================
 // BLE VERBINDUNGS-MANAGEMENT
 // ==========================================
 class ScooterClientCallback : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient* pclient) override {
-        isScooterConnected = false; isScooterAuthenticated = false; updateDisplay();
+        pChAuthTx = nullptr;
+        pChDataTx = nullptr;
+        isScooterConnected = false;
+        isScooterAuthenticated = false;
+        flagUpdateDisplay = true;
     }
 };
 
 class Remote1ClientCallback : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient* pclient) override {
-        isRemote1Connected = false; updateDisplay();
+        isRemote1Connected = false;
+        flagUpdateDisplay = true;
     }
 };
 
 class Remote2ClientCallback : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient* pclient) override {
-        isRemote2Connected = false; updateDisplay();
+        isRemote2Connected = false;
+        flagUpdateDisplay = true;
     }
 };
 
@@ -336,7 +385,15 @@ void connectToScooter() {
         pScooterClient->setConnectTimeout(3); 
     }
     
-    if (pScooterClient->connect(NimBLEAddress(SCOOTER_MAC))) {
+    if (pScooterClient->isConnected()) return;
+
+    // Alte Pointer zwingend vor dem Connect-Versuch löschen!
+    pChAuthTx = nullptr;
+    pChDataTx = nullptr;
+
+    if (pScooterClient->connect(NimBLEAddress(SCOOTER_MAC), true)) {
+        if (!pScooterClient->isConnected()) return;
+
         NimBLERemoteService* pAuthService = pScooterClient->getService(authServiceUUID);
         if (pAuthService) {
             pChAuthTx = pAuthService->getCharacteristic(authTxUUID);
@@ -351,12 +408,18 @@ void connectToScooter() {
             if (pRx && pRx->canNotify()) pRx->subscribe(true, scooterDataCallback);
         }
 
-        isScooterConnected = true;
-        updateDisplay();
+        // Prüfen, ob beide wichtigen Characteristics gefunden wurden
+        if (pChAuthTx != nullptr && pChDataTx != nullptr && pScooterClient->isConnected()) {
+            isScooterConnected = true;
+            flagUpdateDisplay = true;
 
-        if (pChAuthTx) {
             String authCmd = "AT+PWD[" + String(PIN_CODE) + "]";
             pChAuthTx->writeValue((const uint8_t*)authCmd.c_str(), authCmd.length(), false);
+        } else {
+            // Halboffene / fehlerhafte Verbindung sauber trennen
+            pChAuthTx = nullptr;
+            pChDataTx = nullptr;
+            pScooterClient->disconnect();
         }
     }
 }
@@ -367,23 +430,35 @@ void connectToRemote1() {
         pRemote1Client->setClientCallbacks(new Remote1ClientCallback(), false);
         pRemote1Client->setConnectTimeout(3); 
     }
-    if (pRemote1Client->connect(NimBLEAddress(REMOTE1_MAC))) {
+
+    if (pRemote1Client->isConnected()) return;
+
+    if (pRemote1Client->connect(NimBLEAddress(REMOTE1_MAC), true)) {
         pRemote1Client->secureConnection();
         delay(800); 
+        
+        // Prüfen, ob die Verbindung das Delay überlebt hat
+        if (!pRemote1Client->isConnected()) return;
+
         NimBLERemoteService* pHidService = pRemote1Client->getService(hidServiceUUID);
-        if (pHidService) {
+        if (pHidService && pRemote1Client->isConnected()) {
             auto chars = pHidService->getCharacteristics(true);
-            if(chars) {
+            if (chars) {
                 for (auto pCh : *chars) {
+                    if (!pRemote1Client->isConnected()) break;
                     NimBLEUUID uuid = pCh->getUUID();
                     if (uuid.equals(NimBLEUUID((uint16_t)0x2a4e))) { uint8_t m = 0x01; pCh->writeValue(&m, 1, true); delay(50); } 
                     else if (uuid.equals(NimBLEUUID((uint16_t)0x2a4c))) { uint8_t w = 0x01; pCh->writeValue(&w, 1, false); delay(50); } 
                     else if (pCh->canNotify()) { pCh->subscribe(true, remote1NotifyCallback, true); delay(50); }
                 }
             }
-            isRemote1Connected = true;
-            updateDisplay();
-        } else { pRemote1Client->disconnect(); }
+            if (pRemote1Client->isConnected()) {
+                isRemote1Connected = true;
+                flagUpdateDisplay = true;
+            }
+        } else {
+            pRemote1Client->disconnect();
+        }
     }
 }
 
@@ -393,23 +468,35 @@ void connectToRemote2() {
         pRemote2Client->setClientCallbacks(new Remote2ClientCallback(), false);
         pRemote2Client->setConnectTimeout(3); 
     }
-    if (pRemote2Client->connect(NimBLEAddress(REMOTE2_MAC))) {
+
+    if (pRemote2Client->isConnected()) return;
+
+    if (pRemote2Client->connect(NimBLEAddress(REMOTE2_MAC), true)) {
         pRemote2Client->secureConnection();
         delay(800); 
+        
+        // Prüfen, ob die Verbindung das Delay überlebt hat
+        if (!pRemote2Client->isConnected()) return;
+
         NimBLERemoteService* pHidService = pRemote2Client->getService(hidServiceUUID);
-        if (pHidService) {
+        if (pHidService && pRemote2Client->isConnected()) {
             auto chars = pHidService->getCharacteristics(true);
-            if(chars) {
+            if (chars) {
                 for (auto pCh : *chars) {
+                    if (!pRemote2Client->isConnected()) break;
                     NimBLEUUID uuid = pCh->getUUID();
                     if (uuid.equals(NimBLEUUID((uint16_t)0x2a4e))) { uint8_t m = 0x01; pCh->writeValue(&m, 1, true); delay(50); } 
                     else if (uuid.equals(NimBLEUUID((uint16_t)0x2a4c))) { uint8_t w = 0x01; pCh->writeValue(&w, 1, false); delay(50); } 
                     else if (pCh->canNotify()) { pCh->subscribe(true, remote2NotifyCallback, true); delay(50); }
                 }
             }
-            isRemote2Connected = true;
-            updateDisplay();
-        } else { pRemote2Client->disconnect(); }
+            if (pRemote2Client->isConnected()) {
+                isRemote2Connected = true;
+                flagUpdateDisplay = true;
+            }
+        } else {
+            pRemote2Client->disconnect();
+        }
     }
 }
 
@@ -445,30 +532,53 @@ void setup() {
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
     NimBLEDevice::setSecurityCallbacks(new MySecurity());
     
-    // Reihenfolge der Verbindungen
+    // Erste Verbindungsversuche beim Start
     connectToScooter();
+    lastScooterReconnect = millis();
+    
     connectToRemote1();
+    lastRemote1Reconnect = millis();
+    
     connectToRemote2();
+    lastRemote2Reconnect = millis();
 }
 
 // ==========================================
 // MAIN LOOP
 // ==========================================
 void loop() {
+    // 1. Anstehende Scooter-Befehle sicher im Haupt-Thread ausführen
+    if (flagSendCommand) {
+        flagSendCommand = false;
+        sendScooterCommand();
+    }
+
+    // 2. Geänderte Einstellungen im NVS speichern
+    if (flagSavePrefs) {
+        flagSavePrefs = false;
+        savePreferences();
+    }
+
+    // 3. Display sicher aktualisieren (verhindert I2C-Crashes)
+    if (flagUpdateDisplay) {
+        flagUpdateDisplay = false;
+        updateDisplay();
+    }
+
+    // 4. Reconnects einzeln pro Schleifendurchlauf abarbeiten,
+    // damit Befehle und Display-Updates nicht über Sekunden blockiert werden
     if (!isScooterConnected && (millis() - lastScooterReconnect > 3000)) { 
         lastScooterReconnect = millis();
         connectToScooter();
-    }
-    
-    if (!isRemote1Connected && (millis() - lastRemote1Reconnect > 5000)) { 
+    } 
+    else if (!isRemote1Connected && (millis() - lastRemote1Reconnect > 5000)) { 
         lastRemote1Reconnect = millis();
         connectToRemote1();
-    }
-
-    if (!isRemote2Connected && (millis() - lastRemote2Reconnect > 5000)) { 
+    } 
+    else if (!isRemote2Connected && (millis() - lastRemote2Reconnect > 5000)) { 
         lastRemote2Reconnect = millis();
         connectToRemote2();
     }
     
-    delay(100);
+    delay(50);
 }
